@@ -2,12 +2,21 @@ import { useCallback, useEffect, useMemo, useState } from 'react'
 import './App.css'
 import { MapLocationSearch } from './components/MapLocationSearch'
 import { RobberyMap } from './components/RobberyMap'
-import { loadReports, saveReports } from './storage'
+import { formatDbError } from './dbError'
+import { fetchReports, insertReport, subscribeToNewReports } from './reportsApi'
+import { isSupabaseConfigured } from './supabaseClient'
 import type { RobberyReport } from './types'
 import './fixLeafletIcons'
 
+function mergeIncoming(prev: RobberyReport[], incoming: RobberyReport): RobberyReport[] {
+  if (prev.some((r) => r.id === incoming.id)) return prev
+  return [...prev, incoming].sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+}
+
 function App() {
-  const [reports, setReports] = useState<RobberyReport[]>(() => loadReports())
+  const [reports, setReports] = useState<RobberyReport[]>([])
+  const [reportsLoad, setReportsLoad] = useState<'idle' | 'loading' | 'ready' | 'error'>('idle')
+  const [reportsError, setReportsError] = useState<string | null>(null)
   const [draft, setDraft] = useState<{ lat: number; lng: number } | null>(null)
   const [title, setTitle] = useState('')
   const [description, setDescription] = useState('')
@@ -15,10 +24,44 @@ function App() {
   const [highlightId, setHighlightId] = useState<string | null>(null)
   const [flyTo, setFlyTo] = useState<{ lat: number; lng: number; nonce: number } | null>(null)
   const [formError, setFormError] = useState<string | null>(null)
+  const [submitting, setSubmitting] = useState(false)
 
   useEffect(() => {
-    saveReports(reports)
-  }, [reports])
+    if (!isSupabaseConfigured()) {
+      setReportsLoad('error')
+      setReportsError(
+        'Supabase URL and anon key are missing. Copy .env.example to .env (or .env.local) in the project root — Vite does not load .env.example. Restart npm run dev, then ensure supabase/schema.sql was run in the Supabase SQL editor.',
+      )
+      return
+    }
+
+    let cancelled = false
+    setReportsLoad('loading')
+    setReportsError(null)
+
+    fetchReports()
+      .then((data) => {
+        if (cancelled) return
+        setReports(data)
+        setReportsLoad('ready')
+      })
+      .catch((e: unknown) => {
+        if (cancelled) return
+        setReportsLoad('error')
+        setReportsError(e instanceof Error ? e.message : formatDbError(e))
+      })
+
+    return () => {
+      cancelled = true
+    }
+  }, [])
+
+  useEffect(() => {
+    if (!isSupabaseConfigured()) return
+    return subscribeToNewReports((report) => {
+      setReports((prev) => mergeIncoming(prev, report))
+    })
+  }, [])
 
   const onPickLocation = useCallback((lat: number, lng: number) => {
     setDraft({ lat, lng })
@@ -26,8 +69,12 @@ function App() {
   }, [])
 
   const submitReport = useCallback(
-    (e: React.FormEvent) => {
+    async (e: React.FormEvent) => {
       e.preventDefault()
+      if (!isSupabaseConfigured()) {
+        setFormError('Database is not configured. Set Supabase environment variables.')
+        return
+      }
       if (!draft) {
         setFormError('Click the map to choose where the incident happened.')
         return
@@ -52,13 +99,22 @@ function App() {
         occurredAt: occurred.toISOString(),
         createdAt: new Date().toISOString(),
       }
-      setReports((prev) => [report, ...prev])
-      setDraft(null)
-      setTitle('')
-      setDescription('')
-      setOccurredAt(toDatetimeLocalValue(new Date()))
-      setHighlightId(report.id)
+
+      setSubmitting(true)
       setFormError(null)
+      try {
+        await insertReport(report)
+        setReports((prev) => mergeIncoming(prev, report))
+        setDraft(null)
+        setTitle('')
+        setDescription('')
+        setOccurredAt(toDatetimeLocalValue(new Date()))
+        setHighlightId(report.id)
+      } catch (err) {
+        setFormError(err instanceof Error ? err.message : 'Could not save the report.')
+      } finally {
+        setSubmitting(false)
+      }
     },
     [draft, description, occurredAt, title],
   )
@@ -78,16 +134,28 @@ function App() {
     [reports],
   )
 
+  const configMissing = reportsLoad === 'error' && !isSupabaseConfigured()
+
   return (
     <div className="app">
       <aside className="app__sidebar" aria-label="Reports and form">
         <header className="app__header">
           <h1 className="app__title">Robbery incident map</h1>
           <p className="app__lede">
-            Click anywhere on the map to place a marker, then describe what happened. Reports are stored in
-            this browser only.
+            Click anywhere on the map to place a marker, then describe what happened. Reports are saved to a shared
+            database so everyone sees the same list.
           </p>
         </header>
+
+        {configMissing ? (
+          <p className="app__banner app__banner--warn" role="status">
+            {reportsError}
+          </p>
+        ) : reportsLoad === 'error' && reportsError ? (
+          <p className="app__banner app__banner--warn" role="alert">
+            {reportsError}
+          </p>
+        ) : null}
 
         <form className="report-form" onSubmit={submitReport} noValidate>
           <h2 className="report-form__heading">New report</h2>
@@ -109,6 +177,7 @@ function App() {
               placeholder="e.g. Street robbery near station"
               maxLength={120}
               autoComplete="off"
+              disabled={submitting || configMissing}
             />
           </label>
 
@@ -120,6 +189,7 @@ function App() {
               value={occurredAt}
               onChange={(ev) => setOccurredAt(ev.target.value)}
               required
+              disabled={submitting || configMissing}
             />
           </label>
 
@@ -133,6 +203,7 @@ function App() {
               rows={4}
               required
               minLength={8}
+              disabled={submitting || configMissing}
             />
           </label>
 
@@ -143,11 +214,16 @@ function App() {
           ) : null}
 
           <div className="report-form__actions">
-            <button type="submit" className="btn btn--primary">
-              Submit report
+            <button type="submit" className="btn btn--primary" disabled={submitting || configMissing}>
+              {submitting ? 'Saving…' : 'Submit report'}
             </button>
             {draft ? (
-              <button type="button" className="btn btn--ghost" onClick={() => setDraft(null)}>
+              <button
+                type="button"
+                className="btn btn--ghost"
+                onClick={() => setDraft(null)}
+                disabled={submitting}
+              >
                 Clear marker
               </button>
             ) : null}
@@ -158,7 +234,9 @@ function App() {
           <h2 id="recent-heading" className="recent__title">
             Reports ({reports.length})
           </h2>
-          {sortedReports.length === 0 ? (
+          {reportsLoad === 'loading' ? (
+            <p className="recent__empty">Loading reports…</p>
+          ) : sortedReports.length === 0 ? (
             <p className="recent__empty">No reports yet. Add one from the map.</p>
           ) : (
             <ul className="recent__list">

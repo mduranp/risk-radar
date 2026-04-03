@@ -49,6 +49,21 @@
   margin: 0;
 }
 
+.app__banner {
+  font-size: 0.85rem;
+  line-height: 1.45;
+  margin: 0 0 0.75rem;
+  padding: 0.55rem 0.65rem;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+}
+
+.app__banner--warn {
+  color: var(--text-h);
+  background: var(--accent-bg);
+  border-color: var(--accent-border);
+}
+
 .app__map {
   flex: 1 1 auto;
   min-height: 220px;
